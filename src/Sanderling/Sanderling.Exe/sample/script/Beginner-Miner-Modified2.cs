@@ -32,9 +32,9 @@ string OverviewPreset = null;
 var ActivateHardener = true;
 
 //	Bot will switch mining site when rats are visible and shield hitpoints are lower than this value.
-var SwitchMiningSiteHitpointThresholdPercent = 85;
+var SwitchMiningSiteHitpointThresholdPercent = 60;
 
-var EmergencyWarpOutHitpointPercent = 60;
+var EmergencyWarpOutHitpointPercent = 40;
 
 //	Percentage of fill level at which to enter the offload process.
 var EnterOffloadOreContainerFillPercent = 94;
@@ -45,6 +45,10 @@ var EnterOffloadOreContainerFillPercent = 94;
 //    TODO: We could actually configure it that way :)
 var RetreatOnNeutralOrHostileInLocal = false;
 
+//	bot will start fighting (and stop mining) when hitpoints are lower. 
+var DefenseEnterHitpointThresholdPercent = 85;
+var DefenseExitHitpointThresholdPercent = 90;
+
 //	Name of the container to unload to as shown in inventory.
 string UnloadDestContainerName = "Item Hangar";
 
@@ -52,6 +56,9 @@ string UnloadDestContainerName = "Item Hangar";
 bool UnloadInSpace = false;
 
 string AllowableAsteroidType = "VELDSPAR"; // MUST BE ALL CAPS if used - can only specify one type to mine - if blank then will just mine closest
+
+bool returnDronesToBayOnRetreat = true; // when set to true, bot will attempt to dock back the drones before retreating
+
 //	<- End of configuration section
 
 
@@ -100,7 +107,14 @@ Host.Log(
 
 	if(0 < RetreatReason?.Length && !(Measurement?.IsDocked ?? false))
 	{
-		InitiateWarpToRetreat();
+        if (returnDronesToBayOnRetreat) {
+            DroneEnsureInBay();
+
+        }
+
+        if (!returnDronesToBayOnRetreat || (returnDronesToBayOnRetreat && 0 == DronesInSpaceCount)) {
+            InitiateWarpToRetreat();
+        }
 		continue;
 	}
 
@@ -148,6 +162,16 @@ string RetreatReasonPermanent = null;
 string RetreatReason => RetreatReasonPermanent ?? RetreatReasonTemporary;
 int? LastCheckOreContainerFillPercent = null;
 
+bool	DefenseExit =>
+	(Measurement?.IsDocked ?? false) ||
+	!(0 < ListRatOverviewEntry?.Length)	||
+	(DefenseExitHitpointThresholdPercent < ShieldHpPercent && !(JammedLastAge < 40) &&
+	!(false && 0 < ListRatOverviewEntry?.Length));
+
+bool	DefenseEnter =>
+	!DefenseExit	||
+	!(DefenseEnterHitpointThresholdPercent < ShieldHpPercent) || JammedLastAge < 10;
+
 int OffloadCount = 0;
 
 Func<object> MainStep()
@@ -165,13 +189,21 @@ Func<object> MainStep()
         Undock();
     }
 
+    if(DefenseEnter)
+	{
+		Host.Log("enter defense.");
+		return DefenseStep;
+	}
+
     EnsureOverviewTypeSelectionLoaded();
 
     EnsureWindowInventoryOreContainerIsOpen();
 
     if (ReadyForManeuver)
     {
-        if (OreContainerFilledForOffload)
+        DroneEnsureInBay();
+
+        if (OreContainerFilledForOffload && DronesInSpaceCount == 0)
         {
             if (ReadyForManeuver)
                 InitiateDockToOffload();
@@ -217,10 +249,80 @@ void CloseModalUIElement()
     Sanderling.MouseClickLeft(ButtonClose);
 }
 
+void DroneLaunch()
+{
+	Host.Log("launch drones.");
+	Sanderling.MouseClickRight(DronesInBayListEntry);
+	Sanderling.MouseClickLeft(Menu?.FirstOrDefault()?.EntryFirstMatchingRegexPattern("launch", RegexOptions.IgnoreCase));
+}
+
+void DroneEnsureInBay()
+{
+	if(0 == DronesInSpaceCount)
+		return;
+
+	DroneReturnToBay();
+	
+	Host.Delay(4444);
+}
+
+void DroneReturnToBay()
+{
+	Host.Log("return drones to bay.");
+	Sanderling.MouseClickRight(DronesInSpaceListEntry);
+	Sanderling.MouseClickLeft(Menu?.FirstOrDefault()?.EntryFirstMatchingRegexPattern("return.*bay", RegexOptions.IgnoreCase));
+}
+
 var timesThroughWithCurrentModuleRun = 0;
+
+Func<object>	DefenseStep()
+{
+	if(DefenseExit)
+	{
+		Host.Log("exit defense.");
+		return null;
+	}
+
+	if (!(0 < DronesInSpaceCount))
+		DroneLaunch();
+
+	EnsureOverviewTypeSelectionLoaded();
+
+	var SetRatName =
+		ListRatOverviewEntry?.Select(entry => Regex.Split(entry?.Name ?? "", @"\s+")?.FirstOrDefault())
+		?.Distinct()
+		?.ToArray();
+	
+	var SetRatTarget = Measurement?.Target?.Where(target =>
+		SetRatName?.Any(ratName => target?.TextRow?.Any(row => row.RegexMatchSuccessIgnoreCase(ratName)) ?? false) ?? false);
+	
+	var RatTargetNext = SetRatTarget?.OrderBy(target => target?.DistanceMax ?? int.MaxValue)?.FirstOrDefault();
+	
+	if(null == RatTargetNext)
+	{
+		Host.Log("no rat targeted.");
+		Sanderling.MouseClickRight(ListRatOverviewEntry?.FirstOrDefault());
+		Sanderling.MouseClickLeft(MenuEntryLockTarget);
+	}
+	else
+	{
+		Host.Log("rat targeted. sending drones.");
+		Sanderling.MouseClickLeft(RatTargetNext);
+		Sanderling.MouseClickRight(DronesInSpaceListEntry);
+		Sanderling.MouseClickLeft(Menu?.FirstOrDefault()?.EntryFirstMatchingRegexPattern("engage", RegexOptions.IgnoreCase));
+	}
+	
+	return DefenseStep;
+}
 
 Func<object> InBeltMineStep()
 {
+    if (DefenseEnter)
+	{
+		Host.Log("enter defense.");
+		return DefenseStep;
+	}
+
     var howLongToDelayBetweenInactiveMinerChecksInMilliSeconds = 6000;
     var forceMiningModuleRuntimesToAboutThisManySeconds = 60; // configuration to allow long running mining modules to run in shorter bursts so they don't waste a ton of time running if there's only a small amount of rock left - removing wasted time 
 
@@ -350,6 +452,9 @@ Sanderling.Parse.IWindowOverview WindowOverview =>
 Sanderling.Parse.IWindowInventory WindowInventory =>
     Measurement?.WindowInventory?.FirstOrDefault();
 
+IWindowDroneView	WindowDrones	=>
+	Measurement?.WindowDroneView?.FirstOrDefault();
+
 ITreeViewEntry InventoryActiveShipOreContainer
 {
     get
@@ -415,7 +520,15 @@ Sanderling.Accumulation.IShipUiModule[] SetModuleMinerIsActive =>
     SetModuleMiner?.Where(module => (module?.RampActive ?? false))?.ToArray();   // if it's not there, it's not active
 
 int? MiningRange => SetModuleMiner?.Select(module =>
- module?.TooltipLast?.Value?.RangeOptimal ?? module?.TooltipLast?.Value?.RangeMax ?? module?.TooltipLast?.Value?.RangeWithin ?? 0)?.DefaultIfEmpty(0)?.Min();;
+ module?.TooltipLast?.Value?.RangeOptimal ?? module?.TooltipLast?.Value?.RangeMax ?? module?.TooltipLast?.Value?.RangeWithin ?? 0)?.DefaultIfEmpty(0)?.Min();
+
+DroneViewEntryGroup DronesInBayListEntry =>
+	WindowDrones?.ListView?.Entry?.OfType<DroneViewEntryGroup>()?.FirstOrDefault(Entry => null != Entry?.Caption?.Text?.RegexMatchIfSuccess(@"Drones in bay", RegexOptions.IgnoreCase));
+
+DroneViewEntryGroup DronesInSpaceListEntry =>
+	WindowDrones?.ListView?.Entry?.OfType<DroneViewEntryGroup>()?.FirstOrDefault(Entry => null != Entry?.Caption?.Text?.RegexMatchIfSuccess(@"Drones in Local Space", RegexOptions.IgnoreCase));
+
+int?	DronesInSpaceCount => DronesInSpaceListEntry?.Caption?.Text?.AsDroneLabel()?.Status?.TryParseInt();
 
 // Removing WindowChatChannel since it doesn't work anymore
 //WindowChatChannel chatLocal =>
@@ -823,7 +936,7 @@ bool MeasurementEmergencyWarpOutEnter =>
 void RetreatUpdate()
 {
 
-    if (hostileOrNeutralsInLocal)
+    if (hostileOrNeutralsInLocal && RetreatOnNeutralOrHostileInLocal)
     {
         Host.Log("System overcrowded. Expected '3' StackWindows in local, but found: " + Sanderling.MemoryMeasurementParsed?.Value?.WindowStack?.FirstOrDefault()?.LabelText?.ToList().Count.ToString() + "[Make sure to clear your local window of all messages / notifications for this work]");
     }
